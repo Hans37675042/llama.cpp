@@ -116,6 +116,8 @@ struct llama_model_loader {
     } lazy;
 
     llama_files files;
+    std::vector<std::string> file_names; // path of each shard, same index as files
+    llama_files lazy_files; // override files for lazy mappings (LLAMA_LAZY_DIR), kept alive with the mappings
     llama_ftype ftype;
     llama_fver  fver;
 

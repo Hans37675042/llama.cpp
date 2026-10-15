@@ -10,6 +10,7 @@
 #include <array>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <regex>
@@ -578,6 +579,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        file_names.emplace_back(fname);
         contexts.emplace_back(ctx);
 
         // Save tensors data offset of the main file.
@@ -646,6 +648,7 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                file_names.emplace_back(fname_split);
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -1429,7 +1432,29 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
+            // LLAMA_LAZY_DIR=<dir>: when the file is only mapped for lazy tensors (load mode none), map
+            // <dir>/<basename> instead if it exists. The override must have the same layout as the shard
+            // (e.g. a sparse copy holding only the lazy byte ranges), so it can live on a faster disk.
+            llama_file * map_file = file.get();
+            const char * lazy_dir = getenv("LLAMA_LAZY_DIR");
+            if (lazy_dir && *lazy_dir && !use_mmap && !lazy.for_file(idx).empty() && idx < file_names.size()) {
+                const std::string & name = file_names[idx];
+                const size_t pos = name.find_last_of("/\\");
+                const std::string base = pos == std::string::npos ? name : name.substr(pos + 1);
+                const std::string alt = std::string(lazy_dir) + "/" + base;
+                FILE * probe = ggml_fopen(alt.c_str(), "rb");
+                if (probe) {
+                    fclose(probe);
+                    lazy_files.emplace_back(new llama_file(alt.c_str(), "rb", false));
+                    if (lazy_files.back()->size() != file->size()) {
+                        throw std::runtime_error(format("%s: lazy override %s has size %zu, expected %zu", __func__, alt.c_str(), lazy_files.back()->size(), file->size()));
+                    }
+                    map_file = lazy_files.back().get();
+                    LLAMA_LOG_INFO("%s: lazy tensors of %s are mapped from %s\n", __func__, base.c_str(), alt.c_str());
+                }
+            }
+
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(map_file, prefetch_size, is_numa,
                     lazy.for_file(idx));
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
