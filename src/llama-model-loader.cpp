@@ -718,6 +718,42 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
     }
 
+    // LLAMA_LAZY_GGUF=<path>: a standalone GGUF holding only the lazily read tensors (e.g. the per-layer
+    // n-gram embedding). Tensors found there replace the shard copies, so one file on a fast disk can serve
+    // every quantization of the model (the lazy tensors are identical across them).
+    if (const char * lazy_gguf = getenv("LLAMA_LAZY_GGUF"); lazy_gguf && *lazy_gguf && !fname.empty()) {
+        struct ggml_context * ctx = NULL;
+        struct gguf_init_params params = {
+            /*.no_alloc = */ true,
+            /*.ctx      = */ &ctx,
+        };
+        gguf_context_ptr ctx_gguf { gguf_init_from_file(lazy_gguf, params) };
+        if (!ctx_gguf) {
+            throw std::runtime_error(format("%s: failed to load lazy GGUF %s", __func__, lazy_gguf));
+        }
+        files.emplace_back(new llama_file(lazy_gguf, "rb", false));
+        file_names.emplace_back(lazy_gguf);
+        contexts.emplace_back(ctx);
+        const uint16_t idx = (uint16_t) (files.size() - 1);
+        int n_redirected = 0;
+        for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+            const std::string tensor_name = cur->name;
+            auto it = weights_map.find(tensor_name);
+            if (it == weights_map.end()) {
+                continue; // not part of this model
+            }
+            const ggml_tensor * orig = it->second.tensor;
+            if (orig->type != cur->type || !ggml_are_same_shape(orig, cur)) {
+                throw std::runtime_error(format("%s: tensor '%s' in %s does not match the model (type %s vs %s)",
+                        __func__, tensor_name.c_str(), lazy_gguf, ggml_type_name(cur->type), ggml_type_name(orig->type)));
+            }
+            weights_map.erase(it);
+            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
+            n_redirected++;
+        }
+        LLAMA_LOG_INFO("%s: %d tensor(s) redirected to lazy GGUF %s\n", __func__, n_redirected, lazy_gguf);
+    }
+
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
 
